@@ -1,4 +1,15 @@
-// relay-render.js — Agnes relay for Render (temporary, replaces Cloudflare Worker for HF).
+// relay-render.js v2-streaming-fix (base v1, md5 68af5536) — Agnes relay for Render (temporary, replaces Cloudflare Worker for HF).
+// v2 change, streaming only, no contract change: upstream Cache-Control is now
+// forwarded (v1 dropped it, only Content-Type was forwarded), downstream always
+// sets X-Accel-Buffering: no, and flushHeaders() is called after writeHead.
+// Why: local mock test proved v1 Node pipe DOES forward SSE chunks immediately
+// (TTFB 0.54s for a 0.5s chunk interval), so buffering in production is NOT in
+// Node pipe -- it is in the Cloudflare/Render proxy in front of the service,
+// which buffers unless told not to (no-cache + X-Accel-Buffering: no).
+// v2 also logs first-chunk ms (method, path, ms only, never body) so the next
+// stream test can tell relay-code buffering from proxy buffering from Render
+// logs, and aborts upstream when the client disconnects (hermes 5s timeout
+// used to leave relay generating for the full ~29s after the client gave up).
 // Why Render, not Workers: HF shared egress IP is blocked by Cloudflare edge itself:
 //   HF -> apihub.agnes-ai.com = HTML 403, HF -> *.workers.dev = TLS handshake drop (SSL_ERROR_SYSCALL, 15s).
 //   HF -> Render works (n/ models go through new-api on Render), Render -> Agnes works (new-api Agnes channel).
@@ -54,10 +65,24 @@ const server = http.createServer((req, res) => {
       (upRes) => {
         const outHeaders = {};
         if (upRes.headers["content-type"]) outHeaders["content-type"] = upRes.headers["content-type"];
+        if (upRes.headers["cache-control"]) outHeaders["cache-control"] = upRes.headers["cache-control"];
+        else if (outHeaders["content-type"] && outHeaders["content-type"].includes("text/event-stream")) outHeaders["cache-control"] = "no-cache";
         outHeaders["x-relay-route"] = "render";
+        outHeaders["x-accel-buffering"] = "no";
         res.writeHead(upRes.statusCode || 502, outHeaders);
+        if (typeof res.flushHeaders === "function") res.flushHeaders();
+        let firstChunk = true;
+        upRes.on("data", () => {
+          if (firstChunk) {
+            firstChunk = false;
+            log(`${req.method} ${rest} first-chunk ${Date.now() - t0}ms`);
+          }
+        });
         upRes.pipe(res);
         upRes.on("end", () => log(`${req.method} ${rest} -> ${upRes.statusCode} ${Date.now() - t0}ms`));
+        res.on("close", () => {
+          try { up.destroy(); } catch (e) {}
+        });
       }
     );
     up.on("error", (e) => {
