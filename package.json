@@ -1,0 +1,1 @@
+{"main":"relay-render.js","name":"agnes-relay-render","private":true,"scripts":{"start":"node relay-render.js"},"version":"1.0.0"}
